@@ -1,5 +1,4 @@
 from fastapi import FastAPI, Query, HTTPException, Header, Depends, Request
-from fastapi.responses import JSONResponse
 from typing import Optional, List, Dict
 from pydantic import BaseModel, Field
 import re
@@ -7,6 +6,7 @@ from datetime import datetime, timedelta
 import os
 from dotenv import load_dotenv
 import redis
+import json
 
 # ----------------------
 # Configuration
@@ -52,9 +52,16 @@ class TextStats(BaseModel):
 # ----------------------
 # Authentication
 # ----------------------
-def get_valid_api_keys() -> List[str]:
+def get_valid_api_keys() -> Dict[str, str]:
+    """Return a dictionary of api_key -> plan"""
     env_keys = os.getenv("API_KEYS", "")
-    return [key.strip() for key in env_keys.split(",") if key.strip()]
+    # Example format: key1:free,key2:pro,key3:ultra
+    keys = {}
+    for pair in env_keys.split(","):
+        if ":" in pair:
+            k, p = pair.split(":")
+            keys[k.strip()] = p.strip().lower()
+    return keys
 
 def validate_api_key(
     request: Request,
@@ -62,48 +69,25 @@ def validate_api_key(
     x_rapidapi_key: Optional[str] = Header(None, alias="X-RapidAPI-Key"),
     x_rapidapi_proxy_secret: Optional[str] = Header(None, alias="X-RapidAPI-Proxy-Secret")
 ):
+    keys = get_valid_api_keys()
+    
+    # RapidAPI flow
     if x_rapidapi_proxy_secret:
         if not x_rapidapi_key:
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "success": False,
-                    "data": None,
-                    "error": {
-                        "code": "MISSING_RAPIDAPI_KEY",
-                        "message": "X-RapidAPI-Key header is required"
-                    }
-                }
-            )
-        return x_rapidapi_key
-    
-    if not x_api_key:
-        raise HTTPException(
-            status_code=403,
-            detail={
+            raise HTTPException(status_code=403, detail={
                 "success": False,
                 "data": None,
-                "error": {
-                    "code": "MISSING_API_KEY",
-                    "message": "API key is required in X-API-Key header"
-                }
-            }
-        )
+                "error": {"code": "MISSING_RAPIDAPI_KEY", "message": "X-RapidAPI-Key required"}
+            })
+        # Treat all RapidAPI keys as pro for example
+        return "rapidapi_pro"
     
-    valid_keys = get_valid_api_keys()
-    if x_api_key not in valid_keys:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "success": False,
-                "data": None,
-                "error": {
-                    "code": "INVALID_API_KEY",
-                    "message": "API key is not valid"
-                }
-            }
-        )
-    
+    if not x_api_key or x_api_key not in keys:
+        raise HTTPException(status_code=403, detail={
+            "success": False,
+            "data": None,
+            "error": {"code": "INVALID_API_KEY", "message": "API key not valid"}
+        })
     return x_api_key
 
 # ----------------------
@@ -115,15 +99,12 @@ class RateLimiter:
         self.use_redis = os.getenv("REDIS_URL") is not None
         if self.use_redis:
             try:
-                self.redis_client = redis.from_url(
-                    os.getenv("REDIS_URL"),
-                    decode_responses=True
-                )
+                self.redis_client = redis.from_url(os.getenv("REDIS_URL"), decode_responses=True)
                 self.redis_client.ping()
             except redis.ConnectionError:
                 self.use_redis = False
         self.memory_limits = {}
-    
+
     def check_limit(self, key: str, limit: int, period_seconds: int) -> bool:
         if self.use_redis and self.redis_client:
             redis_key = f"ratelimit:{key}"
@@ -140,10 +121,7 @@ class RateLimiter:
             window_start = now - timedelta(seconds=period_seconds)
             if key not in self.memory_limits:
                 self.memory_limits[key] = []
-            self.memory_limits[key] = [
-                req_time for req_time in self.memory_limits[key]
-                if req_time > window_start
-            ]
+            self.memory_limits[key] = [t for t in self.memory_limits[key] if t > window_start]
             if len(self.memory_limits[key]) >= limit:
                 return False
             self.memory_limits[key].append(now)
@@ -152,28 +130,58 @@ class RateLimiter:
 rate_limiter_instance = RateLimiter()
 
 def rate_limit(request: Request, api_key: str = Depends(validate_api_key)):
-    if "rapidapi" in api_key.lower():
-        limit = 100
-    elif "pro" in api_key.lower():
-        limit = 50
-    else:
-        limit = 10
-    period_seconds = 60
-    if not rate_limiter_instance.check_limit(api_key, limit, period_seconds):
-        raise HTTPException(
-            status_code=429,
-            detail={
-                "success": False,
-                "data": None,
-                "error": {
-                    "code": "RATE_LIMIT_EXCEEDED",
-                    "message": f"Rate limit exceeded. {limit} requests per minute allowed."
-                }
-            }
-        )
+    # Assign rate limits by plan
+    plan_map = get_valid_api_keys()
+    plan = plan_map.get(api_key, "free")
+    
+    limits = {
+        "free": 10,
+        "pro": 50,
+        "ultra": 100,
+        "mega": 200,
+        "rapidapi_pro": 100
+    }
+    period = 60
+    if not rate_limiter_instance.check_limit(api_key, limits.get(plan, 10), period):
+        raise HTTPException(status_code=429, detail={
+            "success": False,
+            "data": None,
+            "error": {"code": "RATE_LIMIT_EXCEEDED", "message": f"Rate limit exceeded for {plan} plan"}
+        })
+    return True
 
 # ----------------------
-# Utilities
+# Feature and Plan Restrictions
+# ----------------------
+feature_map = {
+    "free": ["clean", "lower", "upper"],
+    "pro": ["clean", "lower", "upper", "slug"],
+    "ultra": ["clean", "lower", "upper", "slug", "stats", "batch"],
+    "mega": ["clean", "lower", "upper", "slug", "stats", "batch"],
+    "rapidapi_pro": ["clean", "lower", "upper", "slug", "stats", "batch"]
+}
+
+batch_limits = {
+    "free": 5,
+    "pro": 10,
+    "ultra": 50,
+    "mega": 100,
+    "rapidapi_pro": 50
+}
+
+def check_feature(api_key: str, action: str):
+    plan = get_valid_api_keys().get(api_key, "free")
+    allowed = feature_map.get(plan, [])
+    if action not in allowed:
+        raise HTTPException(status_code=403, detail={
+            "success": False,
+            "data": None,
+            "error": {"code": "FEATURE_NOT_AVAILABLE", "message": f"Action '{action}' not available for {plan} plan"}
+        })
+    return plan
+
+# ----------------------
+# Utility Functions
 # ----------------------
 def clean_text(text: str) -> str:
     text = text.strip()
@@ -187,7 +195,7 @@ def slugify(text: str) -> str:
     text = re.sub(r"-+", "-", text)
     return text
 
-def get_text_stats(text: str) -> TextStats:
+def get_text_stats(text: str):
     words = text.split()
     sentences = len(re.split(r'[.!?]+', text))
     reading_time = len(words) / 200
@@ -204,28 +212,11 @@ def get_text_stats(text: str) -> TextStats:
 # ----------------------
 @app.get("/", response_model=Dict)
 def root():
-    return {
-        "status": "healthy",
-        "service": "Text Processing API",
-        "version": "2.0.0",
-        "timestamp": datetime.utcnow().isoformat()
-    }
+    return {"status": "healthy", "service": "Text Processing API", "version": "2.0.0", "timestamp": datetime.utcnow().isoformat()}
 
 @app.get("/health", include_in_schema=False)
 def health_check():
-    return {
-        "status": "ok",
-        "database": "connected" if rate_limiter_instance.use_redis else "memory",
-        "timestamp": datetime.utcnow().isoformat()
-    }
-
-@app.get("/echo", response_model=APIResponse)
-def echo(text: str = Query(..., min_length=1, max_length=1000)):
-    return APIResponse(
-        success=True,
-        data={"echo": text, "length": len(text), "processed_at": datetime.utcnow().isoformat()},
-        error=None
-    )
+    return {"status": "ok", "database": "connected" if rate_limiter_instance.use_redis else "memory", "timestamp": datetime.utcnow().isoformat()}
 
 @app.get("/text-utils", response_model=APIResponse)
 def text_utils(
@@ -235,16 +226,18 @@ def text_utils(
     _: str = Depends(rate_limit)
 ):
     action = action.lower().strip()
+    plan = check_feature(api_key, action)
+    
     if action == "clean":
         result = clean_text(text)
     elif action == "lower":
         result = text.lower()
     elif action == "upper":
         result = text.upper()
-    elif action == "stats":
-        result = get_text_stats(text).dict(exclude_none=True)
     elif action == "slug":
         result = slugify(text)
+    elif action == "stats":
+        result = get_text_stats(text).dict(exclude_none=True)
     else:
         raise HTTPException(status_code=400, detail={
             "success": False,
@@ -254,11 +247,24 @@ def text_utils(
     return APIResponse(success=True, data={"action": action, "original_length": len(text), "result": result, "processed_at": datetime.utcnow().isoformat()}, error=None)
 
 class BatchTextRequest(BaseModel):
-    texts: List[str] = Field(..., min_items=1, max_items=100)
+    texts: List[str] = Field(..., min_items=1)
     action: str = Field(...)
 
 @app.post("/batch-process", response_model=APIResponse)
-def batch_process(request: BatchTextRequest, api_key: str = Depends(validate_api_key), _: str = Depends(rate_limit)):
+def batch_process(
+    request: BatchTextRequest,
+    api_key: str = Depends(validate_api_key),
+    _: str = Depends(rate_limit)
+):
+    plan = check_feature(api_key, "batch")
+    max_batch = batch_limits.get(plan, 5)
+    if len(request.texts) > max_batch:
+        raise HTTPException(status_code=403, detail={
+            "success": False,
+            "data": None,
+            "error": {"code": "BATCH_LIMIT_EXCEEDED", "message": f"Batch limit {max_batch} exceeded for {plan} plan"}
+        })
+    
     results = []
     for text in request.texts:
         if request.action == "clean":
@@ -269,6 +275,8 @@ def batch_process(request: BatchTextRequest, api_key: str = Depends(validate_api
             result = text.upper()
         elif request.action == "slug":
             result = slugify(text)
+        elif request.action == "stats":
+            result = get_text_stats(text).dict(exclude_none=True)
         else:
             raise HTTPException(status_code=400, detail={
                 "success": False,
@@ -276,12 +284,10 @@ def batch_process(request: BatchTextRequest, api_key: str = Depends(validate_api
                 "error": {"code": "INVALID_ACTION", "message": f"Action '{request.action}' not supported"}
             })
         results.append({"original": text, "processed": result, "length_change": len(result)-len(text)})
-    return APIResponse(success=True, data={"action": request.action, "total_texts": len(results), "results": results}, error=None)
-
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    return JSONResponse(status_code=exc.status_code, content={
-        "success": False,
-        "data": None,
-        "error": exc.detail if isinstance(exc.detail, dict) else {"code": "HTTP_ERROR", "message": str(exc.detail)}
-    })
+    
+    return APIResponse(success=True, data={
+        "action": request.action,
+        "total_texts": len(results),
+        "results": results,
+        "summary": {"total_characters_processed": sum(len(r["original"]) for r in results), "average_length": sum(len(r["original"]) for r in results)/len(results)}
+    }, error=None)
