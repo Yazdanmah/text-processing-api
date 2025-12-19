@@ -1,28 +1,49 @@
 import redis
-from fastapi import HTTPException, Depends
-from app.core.config import REDIS_URL, PLANS
-from app.core.security import authenticate
+from datetime import datetime, timedelta
+from app.core.config import REDIS_URL
 
-redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-redis_client.ping()
 
-def rate_limit(ctx=Depends(authenticate)):
-    plan_cfg = PLANS[ctx["plan"]]
-    key = f"rate:{ctx['consumer']}"
+class RateLimiter:
+    def __init__(self):
+        self.use_redis = False
+        self.redis_client = None
+        self.memory_limits = {}
+        if REDIS_URL:
+            try:
+                self.redis_client = redis.from_url(
+                    REDIS_URL, decode_responses=True
+                )
+                self.redis_client.ping()
+                self.use_redis = True
+            except Exception:
+                self.use_redis = False
+                self.redis_client = None
 
-    current = redis_client.incr(key)
-    if current == 1:
-        redis_client.expire(key, 60)
+    def check_limit(self, key: str, limit: int, period_seconds: int) -> bool:
+        if self.use_redis and self.redis_client:
+            redis_key = f"ratelimit:{key}"
+            current = self.redis_client.get(redis_key)
 
-    if current > plan_cfg["rpm"]:
-        raise HTTPException(
-            429,
-            detail={
-                "success": False,
-                "error": {
-                    "code": "RATE_LIMIT_EXCEEDED",
-                    "message": "Too many requests"
-                }
-            }
-        )
-    return ctx
+            if current and int(current) >= limit:
+                return False
+
+            pipe = self.redis_client.pipeline()
+            pipe.incr(redis_key)
+            pipe.expire(redis_key, period_seconds)
+            pipe.execute()
+            return True
+        now = datetime.utcnow()
+        window_start = now - timedelta(seconds=period_seconds)
+
+        if key not in self.memory_limits:
+            self.memory_limits[key] = []
+
+        self.memory_limits[key] = [
+            t for t in self.memory_limits[key] if t > window_start
+        ]
+
+        if len(self.memory_limits[key]) >= limit:
+            return False
+
+        self.memory_limits[key].append(now)
+        return True
