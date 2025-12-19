@@ -1,0 +1,2 @@
+REDIS_URL=redis://localhost:6379/0
+API_KEYS=localkey1:free,localkey2:pro
