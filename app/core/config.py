@@ -3,12 +3,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-REDIS_URL = os.getenv("REDIS_URL")
-if not REDIS_URL:
-    raise RuntimeError("REDIS_URL is required")
+# --------------------------------------------------
+# Optional Redis configuration
+# --------------------------------------------------
+# If REDIS_URL is not set, the app will use
+# in-memory rate limiting as a fallback.
+REDIS_URL = os.getenv("REDIS_URL")  # Optional, DO NOT enforce
 
+# --------------------------------------------------
+# API Keys configuration
+# Format: key1:free,key2:pro,key3:ultra
+# --------------------------------------------------
 API_KEYS = os.getenv("API_KEYS", "")
 
+# --------------------------------------------------
+# Plans configuration (commercial-ready)
+# --------------------------------------------------
 PLANS = {
     "free": {
         "rpm": 10,
@@ -25,9 +35,14 @@ PLANS = {
         "features": ["clean", "lower", "upper", "slug", "stats", "batch"],
         "batch_limit": 100,
     },
-    "rapidapi": {
+    "mega": {
+        "rpm": 400,
+        "features": ["clean", "lower", "upper", "slug", "stats", "batch"],
+        "batch_limit": 200,
+    },
+    "rapidapi_pro": {
         "rpm": 100,
         "features": ["clean", "lower", "upper", "slug", "stats", "batch"],
         "batch_limit": 50,
-    }
+    },
 }
