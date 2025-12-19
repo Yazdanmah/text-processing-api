@@ -1,6 +1,8 @@
-import redis
 from datetime import datetime, timedelta
-from app.core.config import REDIS_URL
+import redis
+from fastapi import Depends, HTTPException, Request
+
+from app.core.config import REDIS_URL, PLANS
 
 
 class RateLimiter:
@@ -8,6 +10,7 @@ class RateLimiter:
         self.use_redis = False
         self.redis_client = None
         self.memory_limits = {}
+
         if REDIS_URL:
             try:
                 self.redis_client = redis.from_url(
@@ -32,6 +35,8 @@ class RateLimiter:
             pipe.expire(redis_key, period_seconds)
             pipe.execute()
             return True
+
+        # -------- Memory fallback --------
         now = datetime.utcnow()
         window_start = now - timedelta(seconds=period_seconds)
 
@@ -47,3 +52,43 @@ class RateLimiter:
 
         self.memory_limits[key].append(now)
         return True
+
+
+# Singleton instance
+rate_limiter = RateLimiter()
+
+
+# --------------------------------------------------
+# FastAPI dependency
+# --------------------------------------------------
+def rate_limit(request: Request):
+    """
+    Rate limit dependency for FastAPI routes
+    """
+    api_key = (
+        request.headers.get("X-API-Key")
+        or request.headers.get("X-RapidAPI-Key")
+        or "anonymous"
+    )
+
+    plan = "free"
+    for k, p in PLANS.items():
+        if api_key.startswith(k):
+            plan = k
+            break
+
+    rpm = PLANS.get(plan, {}).get("rpm", 10)
+
+    if not rate_limiter.check_limit(api_key, rpm, 60):
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "success": False,
+                "error": {
+                    "code": "RATE_LIMIT_EXCEEDED",
+                    "message": "Too many requests"
+                },
+            },
+        )
+
+    return True
